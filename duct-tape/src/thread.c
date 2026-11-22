@@ -105,6 +105,16 @@ dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* con
 	return thread;
 };
 
+// Caller holds the thread lock. A running expiration drops its own reference.
+static void cancel_wait_timer_locked(thread_t thread) {
+	if (thread->wait_timer_is_set) {
+		thread->wait_timer_is_set = FALSE;
+		if (timer_call_cancel(&thread->wait_timer)) {
+			thread->wait_timer_active--;
+		}
+	}
+}
+
 void dtape_thread_destroy(dtape_thread_t* thread) {
 	dtape_log_debug("%llu: thread being destroyed", thread->xnu_thread.thread_id);
 
@@ -129,15 +139,12 @@ void dtape_thread_destroy(dtape_thread_t* thread) {
 	 *	Cancel wait timer, and wait for
 	 *	concurrent expirations.
 	 */
-	if (thread->xnu_thread.wait_timer_is_set) {
-		thread->xnu_thread.wait_timer_is_set = FALSE;
-
-		if (timer_call_cancel(&thread->xnu_thread.wait_timer)) {
-			thread->xnu_thread.wait_timer_active--;
-		}
+	cancel_wait_timer_locked(&thread->xnu_thread);
+	while (thread->xnu_thread.wait_timer_active > 0) {
+		thread_unlock(&thread->xnu_thread);
+		delay(1);
+		thread_lock(&thread->xnu_thread);
 	}
-
-	while (thread->xnu_thread.wait_timer_active > 0);
 
 	// pull the thread from any waitqs it might have been waiting on
 	thread->xnu_thread.state |= TH_TERMINATE;
@@ -431,6 +438,7 @@ void dtape_thread_release(dtape_thread_t* thread) {
 
 void dtape_thread_sigexc_enter(dtape_thread_t* thread) {
 	thread_lock(&thread->xnu_thread);
+	cancel_wait_timer_locked(&thread->xnu_thread);
 	thread->xnu_thread.state &= ~(TH_UNINT | TH_WAIT);
 	thread->xnu_thread.wait_result = THREAD_INTERRUPTED;
 	clear_wait_internal(&thread->xnu_thread, THREAD_INTERRUPTED);
@@ -463,6 +471,7 @@ void dtape_thread_sigexc_exit(dtape_thread_t* thread) {
 
 void dtape_thread_dying(dtape_thread_t* thread) {
 	thread_lock(&thread->xnu_thread);
+	cancel_wait_timer_locked(&thread->xnu_thread);
 	thread->xnu_thread.state &= ~(TH_UNINT | TH_WAIT);
 	thread->xnu_thread.state |= TH_TERMINATE;
 	thread->xnu_thread.wait_result = THREAD_INTERRUPTED;
@@ -548,7 +557,8 @@ wait_result_t thread_block(thread_continue_t continuation) {
 // thread locked
 boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
-	thread->xnu_thread.wait_result = wresult;
+	cancel_wait_timer_locked(xthread);
+	xthread->wait_result = wresult;
 	dtape_hooks->thread_resume(thread->context);
 	return TRUE;
 };
