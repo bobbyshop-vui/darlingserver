@@ -367,10 +367,22 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture) {
 		// notify listeners that we have exec'd (i.e. been replaced)
 		_notifyListeningKqchannels(NOTE_EXEC, 0);
 	} else {
-		// notify the parent process (if we have one) that we've arrived
+		// notify the parent process (if we have one) that we've arrived.
+		// the parent may have died in the meantime (e.g. it crashed right after
+		// forking); its fork-wait semaphore is then already destroyed and
+		// raising it brought the whole server down with a NULL dereference.
 		if (auto parent = _parentProcess.lock()) {
-			dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
-			parent->_notifyListeningKqchannels(NOTE_FORK, nsid());
+			bool notified = false;
+			{
+				std::shared_lock parentLock(parent->_rwlock);
+				if (parent->_dtapeForkWaitSemaphore && !parent->_dead) {
+					dtape_semaphore_up(parent->_dtapeForkWaitSemaphore);
+					notified = true;
+				}
+			}
+			if (notified) {
+				parent->_notifyListeningKqchannels(NOTE_FORK, nsid());
+			}
 		}
 	}
 };
@@ -727,9 +739,16 @@ void DarlingServer::Process::notifyDead() {
 	// dtape_thread_release needs a microthread context, so we call it within a kernel microthread
 	// also destroy the fork-wait semaphore here
 	Thread::kernelAsync([self = shared_from_this()]() {
-		if (self->_dtapeForkWaitSemaphore) {
-			dtape_semaphore_destroy(self->_dtapeForkWaitSemaphore);
+		dtape_semaphore_t* forkWaitSemaphore = nullptr;
+		{
+			// a child checking in concurrently raises this semaphore under the
+			// same lock (see notifyCheckin)
+			std::unique_lock lock(self->_rwlock);
+			forkWaitSemaphore = self->_dtapeForkWaitSemaphore;
 			self->_dtapeForkWaitSemaphore = nullptr;
+		}
+		if (forkWaitSemaphore) {
+			dtape_semaphore_destroy(forkWaitSemaphore);
 		}
 		dtape_task_release(self->_dtapeTask);
 		self->_dtapeTask = nullptr;
