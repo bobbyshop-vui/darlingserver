@@ -123,7 +123,21 @@ int DarlingServer::Kqchan::setup() {
 			while (self->_inbox.receiveMany(self->_socket->fd()));
 
 			// process the messages
-			self->_processMessages();
+			try {
+				self->_processMessages();
+			} catch (const std::exception& e) {
+				// a malformed message on one channel (e.g. from a client that is dying)
+				// must not take down the whole server: drop the channel as if the peer had hung up
+				kqchanLog.error() << *self << ": Failed to process incoming messages (" << e.what() << "); closing the kqchan" << kqchanLog.endLog;
+
+				Server::sharedInstance().removeMonitor(monitor);
+
+				if (auto process = self->_process.lock()) {
+					process->unregisterKqchan(self);
+				}
+
+				return;
+			}
 		}
 
 		if (static_cast<uint64_t>(event & Monitor::Event::Writable) != 0) {
